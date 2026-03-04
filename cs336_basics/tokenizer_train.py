@@ -72,6 +72,7 @@ def merge_pair(pair_heap, words, word_counts, pair_to_words, pair_count, pair):
                     pair_to_words[new_pair].add(w_idx)
                 
                 word = word[:idx] + (merged_pair,) + word[idx+2:]
+                idx += 1
             idx += 1
 
         words[w_idx] = word
@@ -219,4 +220,4 @@ def train_bpe_openwebtext():
         pickle.dump({"vocab": vocab, "merges": merges}, f)
 # %%
 if __name__ == "__main__":
-    train_bpe_openwebtext()
+    train_bpe_tinystories()
