@@ -1,5 +1,6 @@
 # %%
 from typing import Iterable, Iterator
+from functools import lru_cache
 from copy import copy
 
 import regex as re
@@ -13,6 +14,7 @@ class Tokenizer:
         self.vocab_to_idx = {v:idx for idx, v in vocab.items()}
         self.merges = merges
         self.merges_idx = {merge:idx for idx, merge in enumerate(merges)}
+        self.lru = []
         if special_tokens is not None:
             self.special_tokens = sorted(special_tokens, reverse=True)
             vocab_set = set(vocab)
@@ -26,28 +28,33 @@ class Tokenizer:
         else:
             self.special_tokens: list[str] = []
 
+    @lru_cache(maxsize=80000)
     def _encode_pretoken(self, ptoken: str) -> list[int]:
         b = [bytes([b]) for b in ptoken.encode()]
         while True:
             min_merge = len(self.merges_idx)
             min_pair = (b'', b'')
             for p, q in zip(b[:-1], b[1:]):
-                if (p, q) in self.merges_idx:
-                    curr_rank = self.merges_idx[(p, q)]
-                    if curr_rank < min_merge:
-                        min_merge = curr_rank
-                        min_pair = p, q
+                curr_rank = self.merges_idx.get((p, q))
+                if curr_rank is not None and curr_rank < min_merge:
+                    min_merge = curr_rank
+                    min_pair = p, q
 
             if min_merge >= len(self.merges):
                 break
 
             merged_pair = min_pair[0] + min_pair[1]
             idx = 0
-            while idx < len(b) - 1:
-                curr_pair = b[idx], b[idx+1]
-                if curr_pair == min_pair:
-                    b = b[:idx] + [merged_pair] + b[idx+2:]
-                idx += 1
+            b_new = []
+            while idx < len(b):
+                if idx < len(b) - 1 and (b[idx], b[idx+1]) == min_pair:
+                    b_new.append(merged_pair)
+                    idx += 2
+                else:
+                    b_new.append(b[idx])
+                    idx += 1
+
+            b = b_new
             
         return [self.vocab_to_idx[p] for p in b]
 
@@ -77,9 +84,9 @@ class Tokenizer:
                 case int(a):
                     tokens.append(a)
                 case str(b):
-                    ptok = re.findall(C_PAT, b)
-                    for ptok_tokens in map(self._encode_pretoken, ptok):
-                        tokens.extend(ptok_tokens)
+                    ptok = re.finditer(C_PAT, b)
+                    for pretokens in ptok:
+                        tokens.extend(self._encode_pretoken(pretokens.group()))
 
         return tokens
 
