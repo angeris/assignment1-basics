@@ -8,12 +8,18 @@ import regex as re
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 C_PAT = re.compile(PAT)
 
+
 class Tokenizer:
-    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
         self.vocab = copy(vocab)
-        self.vocab_to_idx = {v:idx for idx, v in vocab.items()}
+        self.vocab_to_idx = {v: idx for idx, v in vocab.items()}
         self.merges = merges
-        self.merges_idx = {merge:idx for idx, merge in enumerate(merges)}
+        self.merges_idx = {merge: idx for idx, merge in enumerate(merges)}
         self.lru = []
         if special_tokens is not None:
             self.special_tokens = sorted(special_tokens, reverse=True)
@@ -25,6 +31,9 @@ class Tokenizer:
                     idx += 1
 
             del vocab_set
+
+            escaped_special_tokens = [re.escape(t) for t in self.special_tokens]
+            self.special_token_re = re.compile(f"({'|'.join(escaped_special_tokens)})")
         else:
             self.special_tokens: list[str] = []
 
@@ -33,7 +42,7 @@ class Tokenizer:
         b = [bytes([b]) for b in ptoken.encode()]
         while True:
             min_merge = len(self.merges_idx)
-            min_pair = (b'', b'')
+            min_pair = (b"", b"")
             for p, q in zip(b[:-1], b[1:]):
                 curr_rank = self.merges_idx.get((p, q))
                 if curr_rank is not None and curr_rank < min_merge:
@@ -47,7 +56,7 @@ class Tokenizer:
             idx = 0
             b_new = []
             while idx < len(b):
-                if idx < len(b) - 1 and (b[idx], b[idx+1]) == min_pair:
+                if idx < len(b) - 1 and (b[idx], b[idx + 1]) == min_pair:
                     b_new.append(merged_pair)
                     idx += 2
                 else:
@@ -55,9 +64,8 @@ class Tokenizer:
                     idx += 1
 
             b = b_new
-            
-        return [self.vocab_to_idx[p] for p in b]
 
+        return [self.vocab_to_idx[p] for p in b]
 
     def encode(self, text: str) -> list[int]:
         text_chunks = [text]
@@ -77,7 +85,7 @@ class Tokenizer:
                         new_spl_str.append(spl_str[-1])
                         new_chunks.extend(new_spl_str)
             text_chunks = new_chunks
-        
+
         tokens = []
         for chunk in text_chunks:
             match chunk:
@@ -91,8 +99,27 @@ class Tokenizer:
         return tokens
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        for s in iterable:
-            yield from self.encode(s)
+        if not self.special_tokens:
+            for s in iterable:
+                yield from self.encode(s)
+
+            return None
+
+        # Greedily take chunks until finding a special token in the next chunk.
+        iterator = iter(iterable)
+
+        buf = next(iterator)
+        for s in iterator:
+            search = self.special_token_re.search(s)
+            if not search:
+                buf += s
+                continue
+            else:
+                buf += s[: search.end() + 1]
+                yield from self.encode(buf)
+                buf = s[search.end() + 1 :]
 
     def decode(self, ids: list[int]) -> str:
-        return (b''.join(map(lambda x: self.vocab.get(x, b''), ids))).decode(errors='replace')
+        return (b"".join(map(lambda x: self.vocab.get(x, b""), ids))).decode(
+            errors="replace"
+        )
