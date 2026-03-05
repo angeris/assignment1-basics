@@ -5,7 +5,25 @@ from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 from cs336_basics.tokenizer_train import train_bpe
 from cs336_basics.tokenizer import Tokenizer
-from cs336_basics.nn_stuff import Linear, Embedding, RMSNorm, silu, SwiGLU, RoPE
+from cs336_basics.nn_stuff import (
+    Linear,
+    Embedding,
+    RMSNorm,
+    silu,
+    SwiGLU,
+    RoPE,
+    softmax,
+    scaled_dot_product_attention,
+    MultiheadSelfAttention,
+    TransformerBlock,
+    TransformerLM,
+)
+from cs336_basics.training_stuff import (
+    cross_entropy,
+    AdamW,
+    cosine_schedule,
+    gradient_clipping,
+)
 
 import numpy.typing as npt
 import torch
@@ -89,8 +107,7 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    swiglu = SwiGLU(d_model)
-    swiglu.d_ff = d_ff
+    swiglu = SwiGLU(d_model, d_ff)
     swiglu.W_1.W = w1_weight
     swiglu.W_2.W = w2_weight
     swiglu.W_3.W = w3_weight
@@ -116,7 +133,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -150,7 +167,11 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    multiheadattn = MultiheadSelfAttention(d_model, num_heads)
+    multiheadattn.W_QKV.W = torch.cat((q_proj_weight, k_proj_weight, v_proj_weight))
+    multiheadattn.W_O.W = o_proj_weight
+
+    return multiheadattn.forward(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -190,7 +211,11 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    multiheadattn = MultiheadSelfAttention(d_model, num_heads, theta, max_seq_len)
+    multiheadattn.W_QKV.W = torch.cat((q_proj_weight, k_proj_weight, v_proj_weight))
+    multiheadattn.W_O.W = o_proj_weight
+
+    return multiheadattn.forward(in_features, token_positions)
 
 
 def run_rope(
@@ -287,7 +312,30 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformer_block = TransformerBlock(
+        d_model, num_heads, d_ff, theta=theta, max_seq_len=max_seq_len
+    )
+
+    transformer_block.multihead_attn.W_QKV.W = torch.cat(
+        (
+            weights["attn.q_proj.weight"],
+            weights["attn.k_proj.weight"],
+            weights["attn.v_proj.weight"],
+        )
+    )
+    transformer_block.multihead_attn.W_O.W = weights["attn.output_proj.weight"]
+
+    transformer_block.rms_norm_mha.gains = weights["ln1.weight"]
+
+    transformer_block.swiglu.W_1.W = weights["ffn.w1.weight"]
+    transformer_block.swiglu.W_2.W = weights["ffn.w2.weight"]
+    transformer_block.swiglu.W_3.W = weights["ffn.w3.weight"]
+
+    transformer_block.rms_norm_swiglu.gains = weights["ln2.weight"]
+
+    token_positions = torch.arange(0, in_features.shape[-2])
+
+    return transformer_block.forward(in_features, token_positions)
 
 
 def run_transformer_lm(
@@ -314,7 +362,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE $\\Theta$ parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -369,7 +417,44 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer = TransformerLM(
+        vocab_size,
+        context_length,
+        num_layers,
+        d_model,
+        num_heads,
+        d_ff,
+        theta=rope_theta,
+    )
+
+    transformer.embedding.embed_mat = weights["token_embeddings.weight"]
+
+    for layer, transformer_block in enumerate(transformer.transformer_blocks):
+        transformer_block.multihead_attn.W_QKV.W = torch.cat(
+            (
+                weights[f"layers.{layer}.attn.q_proj.weight"],
+                weights[f"layers.{layer}.attn.k_proj.weight"],
+                weights[f"layers.{layer}.attn.v_proj.weight"],
+            )
+        )
+        transformer_block.multihead_attn.W_O.W = weights[
+            f"layers.{layer}.attn.output_proj.weight"
+        ]
+
+        transformer_block.rms_norm_mha.gains = weights[f"layers.{layer}.ln1.weight"]
+
+        transformer_block.swiglu.W_1.W = weights[f"layers.{layer}.ffn.w1.weight"]
+        transformer_block.swiglu.W_2.W = weights[f"layers.{layer}.ffn.w2.weight"]
+        transformer_block.swiglu.W_3.W = weights[f"layers.{layer}.ffn.w3.weight"]
+
+        transformer_block.rms_norm_swiglu.gains = weights[f"layers.{layer}.ln2.weight"]
+
+    transformer.rms_norm.gains = weights["ln_final.weight"]
+    transformer.output_embedding.W = weights["lm_head.weight"]
+
+    token_positions = torch.arange(0, in_indices.shape[-1])
+
+    return transformer.forward(in_indices, token_positions)
 
 
 def run_rmsnorm(
@@ -448,7 +533,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(
@@ -466,7 +551,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(
@@ -480,14 +565,14 @@ def run_gradient_clipping(
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -515,7 +600,9 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return cosine_schedule(
+        it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters
+    )
 
 
 def run_save_checkpoint(
